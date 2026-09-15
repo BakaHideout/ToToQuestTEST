@@ -106,7 +106,8 @@
 
   .player-pin { position:absolute; left:50%; top:58%; transform: translate(-50%,-100%); z-index:15; text-align:center; }
   .player-shadow { width:26px; height:9px; border-radius:50%; background:rgba(0,0,0,0.28); margin:2px auto 0; }
-  .player-avatar { font-size:40px; filter: drop-shadow(0 4px 4px rgba(0,0,0,0.25)); animation: bob 1.6s ease-in-out infinite; }
+  .player-avatar { font-size:40px; filter: drop-shadow(0 4px 4px rgba(0,0,0,0.25)); animation: bob 2.6s ease-in-out infinite; }
+  .player-avatar.walking { animation: bob 0.55s ease-in-out infinite; }
   @keyframes bob { 0%,100%{transform:translateY(0);} 50%{transform:translateY(-4px);} }
 
   .toto-node, .gym-node { position:absolute; transform: translate(-50%,-100%); text-align:center; cursor:pointer; z-index:10; }
@@ -503,8 +504,10 @@
   }
   async function persist(){
     if (!state.loggedIn || !state.email) return;
-    try { await window.storage.set('totoquest-profile:'+state.email, JSON.stringify(state), false); }
-    catch(e){ console.error('save failed', e); }
+    try {
+      const res = await window.storage.set('totoquest-profile:'+state.email, JSON.stringify(state), false);
+      if (!res) console.error('save returned empty result');
+    } catch(e){ console.error('save failed', e); showToast('⚠️ Could not save progress'); }
   }
   function startAutosave(){ if (saveTimer) clearInterval(saveTimer); saveTimer = setInterval(persist, 5000); }
   function stopAutosave(){ if (saveTimer) clearInterval(saveTimer); saveTimer=null; }
@@ -537,6 +540,8 @@
       avatar: gender==='male' ? 'male':'female',
       energy:100, collection:[], geo:null, activeTab:'map', viaGoogle: !!viaGoogle
     };
+    // Save the account immediately so it exists even if the player never hits Logout.
+    await persist();
     showScreen('char');
     $$('.char-card').forEach(c=>c.classList.toggle('sel', c.dataset.av===state.avatar));
   }
@@ -556,7 +561,7 @@
 
   function seedWorld(){ if (state.collection.length===0){ state.collection.push(makeToto('normal')); } }
 
-  function enterGame(isNew){
+  async function enterGame(isNew){
     seedWorld();
     const av = state.avatar==='male' ? '🧙‍♂️' : '🧙‍♀️';
     $('#hud-avatar').textContent = av; $('#player-avatar').textContent = av; $('#profile-avatar').textContent = av;
@@ -565,20 +570,86 @@
     $('#admin-panel').style.display = (state.email && state.email.toLowerCase()===ADMIN_EMAIL) ? 'block' : 'none';
     showScreen('game');
     refreshHUD(); renderCollection(); renderChallenger(); startAutosave(); locate(); spawnClouds();
+    await persist(); // commit the starter Toto / avatar pick immediately, don't wait on the 5s timer
   }
   function refreshHUD(){
     $('#hud-energy').textContent = state.energy; $('#profile-energy').textContent = state.energy; $('#profile-count').textContent = state.collection.length;
   }
 
   // ---------------- GEO / WORLD RENDER ----------------
+  // The world's decorations/spawns are generated once around an "anchor" GPS point.
+  // As you physically walk, we track real displacement from that anchor in meters and
+  // scroll the world underneath the (screen-fixed) player by that amount, like Pokemon GO.
+  // When you wander far enough from the anchor, we quietly re-anchor and regenerate the
+  // patch of world around your new position so you can keep walking indefinitely.
+  const GPS_SCALE = 3.2;     // pixels of world-scroll per real meter walked
+  const REGEN_DIST_M = 260;  // meters from anchor before we re-center the world
+  let watchId = null;
+  let lastMoveTs = Date.now();
+  let idleCheckTimer = null;
+
+  function metersDelta(lat0, lon0, lat1, lon1){
+    const mPerDegLat = 110540;
+    const mPerDegLon = 111320 * Math.cos(lat0 * Math.PI/180);
+    return { east: (lon1-lon0) * mPerDegLon, north: (lat1-lat0) * mPerDegLat };
+  }
+  function applyWorldOffset(){
+    const o = state.worldOffset || {x:0,y:0};
+    $('#world').style.transform = 'translate(calc(-50% - '+o.x.toFixed(1)+'px), calc(-50% + '+o.y.toFixed(1)+'px))';
+  }
+  function setAnchorAndBuild(lat, lon){
+    state.geo = {lat, lon};
+    state.geoAnchor = {lat, lon};
+    state.worldOffset = {x:0, y:0};
+    applyWorldOffset();
+    $('#gps-status').textContent = 'GPS: '+lat.toFixed(5)+', '+lon.toFixed(5);
+    buildWorld();
+  }
+  function onPositionUpdate(lat, lon){
+    if (!state.geoAnchor){ setAnchorAndBuild(lat, lon); return; }
+    const prevGeo = state.geo;
+    const step = prevGeo ? metersDelta(prevGeo.lat, prevGeo.lon, lat, lon) : {east:0,north:0};
+    const stepDist = Math.hypot(step.east, step.north);
+    state.geo = {lat, lon};
+    if (stepDist < 1.0) return; // ignore GPS jitter
+    lastMoveTs = Date.now();
+    $('#player-avatar').classList.add('walking');
+
+    const fromAnchor = metersDelta(state.geoAnchor.lat, state.geoAnchor.lon, lat, lon);
+    const dist = Math.hypot(fromAnchor.east, fromAnchor.north);
+    if (dist > REGEN_DIST_M){
+      showToast('New area discovered!');
+      setAnchorAndBuild(lat, lon);
+      return;
+    }
+    state.worldOffset = { x: fromAnchor.east*GPS_SCALE, y: fromAnchor.north*GPS_SCALE };
+    applyWorldOffset();
+    $('#gps-status').textContent = 'GPS: '+lat.toFixed(5)+', '+lon.toFixed(5)+' · walking';
+  }
+  function startWatch(){
+    if (watchId!==null) navigator.geolocation.clearWatch(watchId);
+    watchId = navigator.geolocation.watchPosition(
+      pos => onPositionUpdate(pos.coords.latitude, pos.coords.longitude),
+      err => console.warn('GPS watch error', err),
+      {enableHighAccuracy:true, maximumAge:1000, timeout:15000}
+    );
+  }
+  if (!idleCheckTimer){
+    idleCheckTimer = setInterval(()=>{
+      if (Date.now() - lastMoveTs > 1500) $('#player-avatar').classList.remove('walking');
+    }, 500);
+  }
   function locate(){
     $('#gps-status').textContent = 'GPS: locating…';
-    if (!navigator.geolocation){ state.geo = {lat:42.9634, lon:-83.7834}; $('#gps-status').textContent='GPS unavailable — using default area'; buildWorld(); return; }
+    if (!navigator.geolocation){ setAnchorAndBuild(42.9634, -83.7834); $('#gps-status').textContent='GPS unavailable — using default area'; return; }
     navigator.geolocation.getCurrentPosition(pos=>{
-      state.geo = {lat:pos.coords.latitude, lon:pos.coords.longitude};
-      $('#gps-status').textContent = 'GPS: '+state.geo.lat.toFixed(4)+', '+state.geo.lon.toFixed(4);
-      buildWorld();
-    }, err=>{ state.geo = {lat:42.9634, lon:-83.7834}; $('#gps-status').textContent='GPS denied — using default area'; buildWorld(); }, {enableHighAccuracy:true, timeout:6000});
+      setAnchorAndBuild(pos.coords.latitude, pos.coords.longitude);
+      startWatch();
+    }, err=>{
+      console.warn('GPS error', err);
+      setAnchorAndBuild(42.9634, -83.7834);
+      $('#gps-status').textContent='GPS denied — using default area';
+    }, {enableHighAccuracy:true, timeout:8000});
   }
   $('#btn-locate').onclick = locate;
 
@@ -728,7 +799,14 @@
   $('#btn-admin-energy').onclick = ()=>{ state.energy += 1000000; refreshHUD(); persist(); showToast('Admin: +1,000,000 energy'); };
 
   // ---------------- LOGOUT ----------------
-  $('#btn-logout').onclick = async ()=>{ await persist(); stopAutosave(); state.loggedIn = false; showScreen('auth'); showToast('Logged out — progress saved.'); };
+  $('#btn-logout').onclick = async ()=>{
+    await persist();
+    stopAutosave();
+    if (watchId!==null){ navigator.geolocation.clearWatch(watchId); watchId=null; }
+    state.loggedIn = false;
+    showScreen('auth');
+    showToast('Logged out — progress saved.');
+  };
 
   // ================= BATTLE SCREEN =================
   let battle = null; // {mode, shrineName, opponentTemplate, enemy(fighter), player(fighter), sourceToto, timers:{}, over}
